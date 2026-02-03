@@ -268,7 +268,7 @@ def get_custom_lr_for_named_parameters(
 
     # NOTE: since in the case of pipeline parallelism, each rank only has a subset of the model
     # so we only get the parameters that are in the current rank
-    learning_rate_mapper = lr_mapper_cls(names_to_modules=model.named_modules_in_pp_rank, lr=lr)
+    learning_rate_mapper = lr_mapper_cls(names_to_modules=dict(model.named_modules()), lr=lr)
 
     named_param_groups_with_custom_lr = []
     for (
@@ -648,7 +648,6 @@ def create_table_log(
         LogItem("tp", config.parallelism.tp, "d"),
         LogItem("cp", config.parallelism.context_parallel_size, "d"),
         LogItem("ep", config.parallelism.expert_parallel_size, "d"),
-        LogItem("pp_engine", str(config.parallelism.pp_engine), "s"),
         LogItem("tp_mode", config.parallelism.tp_mode, "s"),
         LogItem("tp_async_comm", str(config.parallelism.tp_linear_async_communication), "s"),
         LogItem("recompute_layer", str(config.parallelism.recompute_layer), "s"),

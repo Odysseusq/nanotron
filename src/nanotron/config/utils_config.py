@@ -5,11 +5,6 @@ from pathlib import Path
 import torch
 
 from nanotron.generation.sampler import SamplerType
-from nanotron.parallel.pipeline_parallel.engine import (
-    AllForwardAllBackwardPipelineEngine,
-    OneForwardOneBackwardPipelineEngine,
-    PipelineEngine,
-)
 from nanotron.parallel.tensor_parallel.nn import TensorParallelLinearMode
 
 
@@ -40,8 +35,6 @@ def serialize(data) -> dict:
             result[field.name] = serialize(value)
         elif isinstance(value, Path):
             result[field.name] = str(value)
-        elif isinstance(value, PipelineEngine):
-            result[field.name] = cast_pipeline_engine_to_str(value)
         elif isinstance(value, TensorParallelLinearMode):
             result[field.name] = value.name
         elif isinstance(value, RecomputeGranularity):
@@ -98,23 +91,3 @@ def cast_str_to_torch_dtype(str_dtype: str):
         return str_to_dtype[str_dtype]
     else:
         raise ValueError(f"dtype should be a string selected in {str_to_dtype.keys()} and not {str_dtype}")
-
-
-def cast_str_to_pipeline_engine(str_pp_engine: str) -> PipelineEngine:
-    if str_pp_engine == "afab":
-        return AllForwardAllBackwardPipelineEngine()
-    elif str_pp_engine == "1f1b":
-        return OneForwardOneBackwardPipelineEngine()
-    else:
-        raise ValueError(f"pp_engine should be a string selected in ['afab', '1f1b'] and not {str_pp_engine}")
-
-
-def cast_pipeline_engine_to_str(pp_engine: PipelineEngine) -> str:
-    if isinstance(pp_engine, AllForwardAllBackwardPipelineEngine):
-        return "afab"
-    elif isinstance(pp_engine, OneForwardOneBackwardPipelineEngine):
-        return "1f1b"
-    else:
-        raise ValueError(
-            f"pp_engine should be aan instance of AllForwardAllBackwardPipelineEngine or OneForwardOneBackwardPipelineEngine, not {type(pp_engine)}"
-        )

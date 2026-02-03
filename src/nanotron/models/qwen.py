@@ -4,6 +4,7 @@ import torch
 from flash_attn.modules.mha import flash_attn_varlen_kvpacked_func
 from torch import nn
 from torch.utils.checkpoint import CheckpointFunction
+import torch.nn.functional as F
 
 from nanotron import distributed as dist
 from nanotron import logging
@@ -18,8 +19,6 @@ from nanotron.nn.layer_norm import TritonRMSNorm
 from nanotron.nn.rotary import RotaryEmbedding
 from nanotron.parallel import ParallelContext
 from nanotron.parallel.parameters import NanotronParameter
-from nanotron.parallel.pipeline_parallel.block import PipelineBlock, TensorPointer
-from nanotron.parallel.pipeline_parallel.p2p import P2P
 from nanotron.parallel.tensor_parallel.functional import sharded_cross_entropy
 from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelColumnLinear,
@@ -31,6 +30,7 @@ from nanotron.random import RandomStates
 from nanotron.scaling.parametrization import SpectralMupParametrizator, StandardParametrizator
 from nanotron.logging import LogMixin
 from nanotron.nn.llama3_ring_attention import llama3_flash_attn_varlen_kvpacked_func, llama3_flash_attn_prepare_cu_seqlens
+
 logger = logging.get_logger(__name__)
 
 
@@ -131,6 +131,7 @@ class CoreAttention(nn.Module):
         return attn_output.view(
             -1, self.local_num_heads * self.head_dim
         )  # [b*s, num_heads, head_dim] -> [b*s, num_heads*head_dim]
+
 
 class Qwen2Attention(LogMixin, nn.Module):
     def __init__(
@@ -237,28 +238,7 @@ class Qwen2Attention(LogMixin, nn.Module):
 
         if self._use_qkv_packed:
             attn_output = self._forward_packed(qkv, seq_length, position_ids, cu_seqlens)
-        # else:
-        #     q, k, v = qkv.split(
-        #         [self.local_q_size, self.local_kv_size, self.local_kv_size], dim=-1
-        #     )  # [batch_size*seq_length, q_size], [batch_size*seq_length, kv_size]
-        #     q = q.view(-1, self.local_num_heads, self.head_dim)  # [b*s, num_heads, head_dim]
-        #     k = k.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
-        #     v = v.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
-        #     if self.config.no_rope_layer is None or (self.layer_idx + 1) % self.config.no_rope_layer != 0:
-        #         rotary_pos_emb = self.rotary_emb(
-        #             position_ids=position_ids if not self.simple_causal_mask else None, seq_length=seq_length
-        #         )  # [b*s, dim] or [seq_length, dim]
-        #         q = self.rotary_emb.apply_rotary_pos_emb(
-        #             q, rotary_pos_emb, seq_length=seq_length
-        #         )  # [b*s, num_heads, head_dim]
-        #         k = self.rotary_emb.apply_rotary_pos_emb(
-        #             k, rotary_pos_emb, seq_length=seq_length
-        #         )  # [b*s, num_kv_heads, head_dim]
-        #     else:
-        #         log_rank(f"skipping rotary for layer {self.layer_idx + 1}", logger=logger, level=logging.DEBUG, rank=0)
-        #     attn_output = self.attention(
-        #         q, k, v, position_ids=position_ids, seq_length=seq_length, cu_seqlens=cu_seqlens
-        #     )
+        
         output = self.o_proj(attn_output)
         # Return original position_ids shape
         return {"hidden_states": output, "position_ids": position_ids.view(-1, seq_length)}
@@ -389,183 +369,6 @@ class Qwen2MLP(nn.Module):
         return {"hidden_states": hidden_states}
 
 
-class Qwen2MoELayer(nn.Module):
-    """Mixture of experts Layer for Qwen2 models."""
-
-    def __init__(
-        self,
-        config: Qwen2Config,
-        parallel_config: Optional[ParallelismArgs],
-        tp_pg: dist.ProcessGroup,
-        layer_idx: int = 0,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-
-        # MoE specific configurations
-        self.num_experts = config.moe_config.num_experts  # Total number of experts
-        self.num_experts_per_token = config.moe_config.top_k  # Number of experts used per token (top-k)
-        self.expert_parallel_size = getattr(parallel_config, "expert_parallel_size", 1)
-        self.num_local_experts = self.num_experts // self.expert_parallel_size  # Experts per device
-
-        # Get TP mode configuration
-        tp_mode = parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE
-        tp_linear_async_communication = (
-            parallel_config.tp_linear_async_communication if parallel_config is not None else False
-        )
-
-        # Router for selecting experts
-        self.router = TensorParallelColumnLinear(
-            self.hidden_size,
-            self.num_experts,
-            pg=tp_pg,
-            mode=tp_mode,
-            bias=False,
-            async_communication=tp_linear_async_communication,
-        )
-
-        # Enable shared experts if configured
-        self.enable_shared_expert = getattr(config.moe_config, "enable_shared_expert", False)
-        if self.enable_shared_expert:
-            self.shared_expert = Qwen2MLP(
-                config=config,
-                parallel_config=parallel_config,
-                tp_pg=tp_pg,
-            )
-            self.shared_expert_gate = TensorParallelColumnLinear(
-                self.hidden_size,
-                1,
-                pg=tp_pg,
-                mode=tp_mode,
-                bias=False,
-                async_communication=tp_linear_async_communication,
-            )
-
-        # Create the expert MLPs
-        self.experts = nn.ModuleList(
-            [
-                Qwen2MLP(
-                    config=config,
-                    parallel_config=parallel_config,
-                    tp_pg=tp_pg,
-                )
-                for _ in range(self.num_local_experts)
-            ]
-        )
-
-        # Whether to recompute MoE layer during backward pass for memory efficiency
-        self.recompute_layer = parallel_config.recompute_layer
-
-        # Token dispatcher type - determines communication pattern
-        self.token_dispatcher_type = getattr(config.moe_config, "token_dispatcher_type", "alltoall")
-        # For more sophisticated implementations, we would add token dispatcher logic here
-
-    def _compute_router_probabilities(self, hidden_states):
-        """Compute routing probabilities for each token to each expert."""
-        router_logits = self.router(hidden_states)  # [batch_size*seq_length, num_experts]
-
-        # Get the top-k experts per token
-        routing_weights, routing_indices = torch.topk(router_logits, k=self.num_experts_per_token, dim=-1)
-
-        # Apply softmax on the top-k values
-        routing_weights = F.softmax(routing_weights, dim=-1)
-
-        return routing_weights, routing_indices
-
-    def _dispatch_tokens(self, hidden_states, routing_weights, routing_indices):
-        """
-        Dispatches tokens to their selected experts.
-        In a full implementation, this would handle the actual token routing logic
-        including communication between devices.
-        """
-        # Simplified implementation - in a complete version this would handle
-        # all-to-all or all-gather communications for distributed experts
-
-        hidden_states.shape[0]
-        dispatched_inputs = []
-        expert_counts = []
-
-        # For each expert, gather the tokens assigned to it
-        for expert_idx in range(self.num_local_experts):
-            # Find tokens that have this expert in their top-k
-            expert_mask = (routing_indices == expert_idx).any(dim=-1)
-            tokens_for_expert = hidden_states[expert_mask]
-
-            # Get the routing weights for this expert
-            expert_positions = (routing_indices == expert_idx).nonzero(as_tuple=True)
-            token_positions, k_positions = expert_positions
-            expert_weights = routing_weights[token_positions, k_positions].unsqueeze(-1)
-
-            # Scale inputs by routing weights
-            scaled_inputs = tokens_for_expert * expert_weights
-
-            dispatched_inputs.append(scaled_inputs)
-            expert_counts.append(len(tokens_for_expert))
-
-        return dispatched_inputs, expert_counts
-
-    def _combine_expert_outputs(self, expert_outputs, routing_indices, original_shape):
-        """
-        Combines outputs from different experts back to the original tensor layout.
-        """
-        # Initialize output tensor with zeros
-        combined_output = torch.zeros(original_shape, device=expert_outputs[0].device)
-
-        for expert_idx, expert_output in enumerate(expert_outputs):
-            if expert_output.shape[0] == 0:  # Skip if no tokens were routed to this expert
-                continue
-
-            # Find positions where this expert was in the top-k
-            expert_mask = (routing_indices == expert_idx).any(dim=-1)
-            combined_output[expert_mask] += expert_output
-
-        return combined_output
-
-    def _core_forward(self, hidden_states):
-        """Core forward logic for MoE layer."""
-        # Get router probabilities
-        routing_weights, routing_indices = self._compute_router_probabilities(hidden_states)
-
-        # Dispatch tokens to experts
-        dispatched_inputs, expert_counts = self._dispatch_tokens(hidden_states, routing_weights, routing_indices)
-
-        # Process tokens with their assigned experts
-        expert_outputs = []
-        for expert_idx, (inputs, count) in enumerate(zip(dispatched_inputs, expert_counts)):
-            if count == 0:  # Skip computation if no tokens assigned
-                expert_outputs.append(torch.tensor([], device=hidden_states.device))
-                continue
-
-            # Forward through the expert
-            output = self.experts[expert_idx](hidden_states=inputs)["hidden_states"]
-            expert_outputs.append(output)
-
-        # Combine expert outputs
-        output = self._combine_expert_outputs(expert_outputs, routing_indices, hidden_states.shape)
-
-        # Add shared expert contribution if enabled
-        if self.enable_shared_expert:
-            shared_expert_output = self.shared_expert(hidden_states=hidden_states)["hidden_states"]
-            shared_gate = torch.sigmoid(self.shared_expert_gate(hidden_states))
-            output = output + shared_gate * shared_expert_output
-
-        return output
-
-    def _checkpointed_forward(self, hidden_states):
-        """Apply gradient checkpointing to save memory during training."""
-        return CheckpointFunction.apply(self._core_forward, True, hidden_states)
-
-    def forward(self, hidden_states):
-        """Forward pass for the MoE layer."""
-        if self.recompute_layer and self.training:
-            hidden_states = self._checkpointed_forward(hidden_states)
-        else:
-            hidden_states = self._core_forward(hidden_states)
-
-        return {"hidden_states": hidden_states}
-
-
 class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -581,7 +384,6 @@ class Qwen2DecoderLayer(nn.Module):
         norm_class = TritonRMSNorm if config._fused_rms_norm else RMSNorm
         self.input_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn = Qwen2Attention(
             config=config,
             parallel_config=parallel_config,
@@ -589,34 +391,22 @@ class Qwen2DecoderLayer(nn.Module):
             cp_pg=cp_pg,
             layer_idx=layer_idx,
         )
-        self.post_attention_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Use MoE layer if this layer is in the MoE layers list
-        if config.moe_config and layer_idx in config.moe_config.layers:
-            from nanotron.nn.moe import Qwen2MoELayer
-
-            self.mlp = Qwen2MoELayer(
-                config=config,
-                parallel_config=parallel_config,
-                tp_pg=tp_pg,
-                layer_idx=layer_idx,
-            )
-        else:
-            self.mlp = Qwen2MLP(
-                config=config,
-                parallel_config=parallel_config,
-                tp_pg=tp_pg,
-                intermediate_size=config.intermediate_size,
-            )
+        self.mlp = Qwen2MLP(
+            config=config,
+            parallel_config=parallel_config,
+            tp_pg=tp_pg,
+            intermediate_size=config.intermediate_size,
+        )
 
         self.recompute_layer = parallel_config.recompute_layer
 
     def _core_forward(
         self,
-        hidden_states: Union[torch.Tensor, TensorPointer],  # [batch_size*seq_length, hidden_size]
-        position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length] where -1 is padding
-        cu_seqlens: Union[torch.Tensor, TensorPointer],
-    ) -> List[Union[torch.Tensor, TensorPointer]]:
+        hidden_states: torch.Tensor,  # [batch_size*seq_length, hidden_size]
+        position_ids: torch.Tensor,  # [batch_size, seq_length] where -1 is padding
+        cu_seqlens: torch.Tensor,
+    ) -> List[torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -641,11 +431,11 @@ class Qwen2DecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: Union[torch.Tensor, TensorPointer],
-        position_ids: Union[torch.Tensor, TensorPointer],
-        cu_seqlens: Union[torch.Tensor, TensorPointer],
-    ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
-        if self.recompute_layer and not isinstance(hidden_states, TensorPointer):
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if self.recompute_layer:
             hidden_states, position_ids, cu_seqlens = self._checkpointed_forward(
                 hidden_states, position_ids, cu_seqlens
             )
@@ -688,8 +478,6 @@ class Qwen2Model(nn.Module):
     ):
         super().__init__()
 
-        # Declare all the nodes
-        self.p2p = P2P(parallel_context.pp_pg, device=torch.device("cuda"))
         self.config = config
         self.parallel_config = parallel_config
         self.parallel_context = parallel_context
@@ -698,67 +486,43 @@ class Qwen2Model(nn.Module):
             parallel_config.tp_linear_async_communication if parallel_config is not None else False
         )
 
-        self.token_position_embeddings = PipelineBlock(
-            p2p=self.p2p,
-            module_builder=Embedding,
-            module_kwargs={
-                "config": config,
-                "parallel_config": parallel_config,
-                "tp_pg": parallel_context.tp_pg,
-            },
-            module_input_keys={"input_ids", "position_ids"},
-            module_output_keys={"input_embeds", "position_ids"},
+        self.token_position_embeddings = Embedding(
+            config=config,
+            parallel_config=parallel_config,
+            tp_pg=parallel_context.tp_pg,
         )
 
         # Create decoder layers
         self.decoder = nn.ModuleList(
             [
-                PipelineBlock(
-                    p2p=self.p2p,
-                    module_builder=Qwen2DecoderLayer,
-                    module_kwargs={
-                        "config": config,
-                        "parallel_config": parallel_config,
-                        "tp_pg": parallel_context.tp_pg,
-                        "cp_pg": parallel_context.cp_pg,
-                        "layer_idx": layer_idx,
-                    },
-                    module_input_keys={"hidden_states", "position_ids", "cu_seqlens"},
-                    module_output_keys={"hidden_states", "position_ids", "cu_seqlens"},
+                Qwen2DecoderLayer(
+                    config=config,
+                    parallel_config=parallel_config,
+                    tp_pg=parallel_context.tp_pg,
+                    cp_pg=parallel_context.cp_pg,
+                    layer_idx=layer_idx,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
 
-        self.final_layer_norm = PipelineBlock(
-            p2p=self.p2p,
-            module_builder=TritonRMSNorm if config._fused_rms_norm else RMSNorm,
-            module_kwargs={"hidden_size": config.hidden_size, "eps": config.rms_norm_eps},
-            module_input_keys={"input"},
-            module_output_keys={"hidden_states"},
-        )
+        norm_class = TritonRMSNorm if config._fused_rms_norm else RMSNorm
+        self.final_layer_norm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.lm_head = PipelineBlock(
-            p2p=self.p2p,
-            # Return sharded logits that will need to be gathered
-            module_builder=TensorParallelColumnLinear,
-            module_kwargs={
-                "in_features": config.hidden_size,
-                "out_features": config.vocab_size,
-                "pg": parallel_context.tp_pg,
-                "bias": False,
-                "mode": self.tp_mode,
-                "async_communication": tp_linear_async_communication,
-                "tp_recompute_allgather": parallel_config.tp_recompute_allgather,
-            },
-            module_input_keys={"x"},
-            module_output_keys={"logits"},
+        self.lm_head = TensorParallelColumnLinear(
+            config.hidden_size,
+            config.vocab_size,
+            pg=parallel_context.tp_pg,
+            bias=False,
+            mode=self.tp_mode,
+            async_communication=tp_linear_async_communication,
+            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
 
     def forward(
         self,
-        input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
-        position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length] where -1 is padding
+        input_ids: torch.Tensor,  # [batch_size, seq_length]
+        position_ids: torch.Tensor,  # [batch_size, seq_length] where -1 is padding
     ):
         output = self.token_position_embeddings(input_ids=input_ids, position_ids=position_ids)
         # Compute cu_seqlens
@@ -804,9 +568,9 @@ class Qwen2Model(nn.Module):
         for decoder_layer in self.decoder:
             decoder_states = decoder_layer(**decoder_states)
 
-        hidden_states = self.final_layer_norm(input=decoder_states["hidden_states"])["hidden_states"]
+        hidden_states = self.final_layer_norm(decoder_states["hidden_states"])
 
-        sharded_logits = self.lm_head(x=hidden_states)["logits"]
+        sharded_logits = self.lm_head(hidden_states)
 
         return sharded_logits
 
@@ -911,28 +675,20 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         if config.z_loss_enabled:
             loss_kwargs["z_loss_coefficient"] = config.z_loss_coefficient
 
-        self.loss = PipelineBlock(
-            p2p=self.model.p2p,
-            module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
-            module_kwargs=loss_kwargs,
-            module_input_keys={
-                "sharded_logits",
-                "label_ids",
-                "label_mask",
-            },
-            module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
-        )
+        loss_cls = LossWithZLoss if config.z_loss_enabled else Loss
+        self.loss = loss_cls(**loss_kwargs)
+        
         self.parallel_context = parallel_context
         self.config = config
         self.parallel_config = parallel_config
 
     def forward(
         self,
-        input_ids: Union[torch.Tensor, TensorPointer],
-        position_ids: Union[torch.Tensor, TensorPointer],
-        label_ids: Union[torch.Tensor, TensorPointer],
-        label_mask: Union[torch.Tensor, TensorPointer],
-    ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        label_ids: torch.Tensor,
+        label_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
         sharded_logits = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -1008,7 +764,12 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         """Get the names of the tied embeddings and lm_head weights"""
         if self.config.tie_word_embeddings is True:
             # Should be similar to ["model.token_position_embeddings.pp_block.token_embedding.weight", "model.lm_head.pp_block.weight"]
-            return ["model.token_position_embeddings.pp_block.token_embedding.weight", "model.lm_head.pp_block.weight"]
+            # Since we removed PipelineBlock, paths might change. 
+            # It was "model.token_position_embeddings.pp_block.token_embedding.weight".
+            # Now "token_position_embeddings" is an Embedding module.
+            # "model.token_position_embeddings.token_embedding.weight"
+            
+            return ["model.token_position_embeddings.token_embedding.weight", "model.lm_head.weight"]
         else:
             return []
 

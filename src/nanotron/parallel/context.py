@@ -13,8 +13,8 @@ class ParallelContext:
     def __init__(
         self,
         tensor_parallel_size: int,
-        pipeline_parallel_size: int,
-        data_parallel_size: int,
+        pipeline_parallel_size: int = 1,
+        data_parallel_size: int = 1,
         context_parallel_size: int = 1,
         expert_parallel_size: int = 1,
         backend: DistributedBackend = "nccl",
@@ -23,18 +23,23 @@ class ParallelContext:
         world_size = int(os.environ["WORLD_SIZE"])
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "8")) if world_size > 8 else world_size
 
+        assert pipeline_parallel_size == 1, "Pipeline Parallelism is removed."
+        assert data_parallel_size == 1, "Data Parallelism is removed."
+        assert context_parallel_size == 1, "Context Parallelism is removed."
+        assert expert_parallel_size == 1, "Expert Parallelism is removed."
+
         assert (
-            tensor_parallel_size * pipeline_parallel_size * context_parallel_size * data_parallel_size
-        ) == world_size, f"TP*CP*DP*PP={tensor_parallel_size}*{pipeline_parallel_size}*{context_parallel_size}*{data_parallel_size}={tensor_parallel_size * pipeline_parallel_size * context_parallel_size * data_parallel_size} != WORLD_SIZE={world_size}"
+            tensor_parallel_size
+        ) == world_size, f"TP={tensor_parallel_size} != WORLD_SIZE={world_size}"
 
         if not dist.is_available():
             raise ValueError("torch.distributed is not available as a package, please install it.")
 
         self.tensor_parallel_size = tensor_parallel_size
-        self.pipeline_parallel_size = pipeline_parallel_size
-        self.data_parallel_size = data_parallel_size
-        self.context_parallel_size = context_parallel_size
-        self.expert_parallel_size = expert_parallel_size
+        self.pipeline_parallel_size = 1
+        self.data_parallel_size = 1
+        self.context_parallel_size = 1
+        self.expert_parallel_size = 1
         self.world_size = world_size
         self.local_world_size = local_world_size
 

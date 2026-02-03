@@ -19,13 +19,11 @@ from nanotron.config.parallelism_config import ParallelismArgs
 from nanotron.config.utils_config import (
     InitScalingMethod,
     RecomputeGranularity,
-    cast_str_to_pipeline_engine,
     cast_str_to_torch_dtype,
     serialize,
 )
 from nanotron.generation.sampler import SamplerType
 from nanotron.logging import get_logger, human_format
-from nanotron.parallel.pipeline_parallel.engine import PipelineEngine
 from nanotron.parallel.tensor_parallel.nn import TensorParallelLinearMode
 from nanotron.config.models_config import Qwen2Config
 
@@ -636,7 +634,6 @@ def get_config_from_dict(
             cast=[Path],
             type_hooks={
                 torch.dtype: cast_str_to_torch_dtype,
-                PipelineEngine: cast_str_to_pipeline_engine,
                 TensorParallelLinearMode: lambda x: TensorParallelLinearMode[x.upper()],
                 RecomputeGranularity: lambda x: RecomputeGranularity[x.upper()],
                 InitScalingMethod: lambda x: InitScalingMethod[x.upper()],

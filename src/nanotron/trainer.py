@@ -62,18 +62,10 @@ from nanotron.logging.timers import nanotron_timer
 from nanotron.metrics_logging import MetricsLogger
 from nanotron.models import NanotronModel, build_model
 from nanotron.models.base import check_model_has_grad
-from nanotron.models.llama import LlamaForTraining, RotaryEmbedding
 from nanotron.models.qwen import Qwen2ForTraining
-from nanotron.models.starcoder2 import Starcoder2ForTraining
 from nanotron.optim.clip_grads import clip_grad_norm
 from nanotron.parallel import ParallelContext
-from nanotron.parallel.data_parallel.utils import sync_gradients_across_dp
 from nanotron.parallel.parameters import NanotronParameter, sanity_check
-from nanotron.parallel.pipeline_parallel.engine import (
-    PipelineEngine,
-    TensorPointer,
-)
-from nanotron.parallel.pipeline_parallel.utils import get_pp_rank_of
 from nanotron.parallel.tensor_parallel.enum import TensorParallelLinearMode
 from nanotron.parallel.tensor_parallel.nn import TensorParallelRowLinear
 from nanotron.parallel.tied_parameters import (
@@ -109,8 +101,6 @@ dist_logger = logging.get_logger(dist.dist.__name__)
 dist_logger.setLevel(logging.WARNING)
 
 CONFIG_TO_MODEL_CLASS = {
-    "LlamaConfig": LlamaForTraining,
-    "Starcoder2Config": Starcoder2ForTraining,
     "Qwen2Config": Qwen2ForTraining,
 }
 
@@ -519,16 +509,12 @@ class DistributedTrainer:
     def train(
         self,
         dataloader_or_dls: Dict[
-            str, Union[Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]], Tuple[Iterator, ...]]
+            str, Union[Iterator[Dict[str, Union[torch.Tensor]]], Tuple[Iterator, ...]]
         ],
         **kwargs,
     ) -> None:
         if self.config.checkpoints.save_initial_state and self.init_checkpoint_path is None:
             self.save_checkpoint()
-
-        self.pipeline_engine: PipelineEngine = self.config.parallelism.pp_engine
-
-        self.pipeline_engine.nb_microbatches = self.n_micro_batches_per_batch
 
         # TODO @nouamanetazi: refactor this
         # Useful mapping
@@ -602,7 +588,7 @@ class DistributedTrainer:
         self.post_training()
 
     def training_step(
-        self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]
+        self, dataloader: Iterator[Dict[str, Union[torch.Tensor]]]
     ) -> Tuple[Iterable[Dict], Optional[torch.Tensor]]:
         before_tbi_sanity_checks(
             self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator, self.lr_scheduler
@@ -613,13 +599,42 @@ class DistributedTrainer:
 
         nanotron_timer("train_batch_iter", "cuda").start()
         with torch.profiler.record_function("train_batch_iter"):
-            outputs = self.pipeline_engine.train_batch_iter(
-                model=self.model,
-                pg=self.parallel_context.pp_pg,
-                batch=(next(dataloader) for _ in range(self.n_micro_batches_per_batch)),
-                nb_microbatches=self.n_micro_batches_per_batch,
-                grad_accumulator=self.grad_accumulator,
-            )
+            outputs = []
+            loss_avg = torch.tensor(0.0, device="cuda")
+            z_loss_avg = None # Not implementing z-loss logic here for simplicity unless present
+
+            for _ in range(self.n_micro_batches_per_batch):
+                batch = next(dataloader)
+                # Move to cuda
+                batch = {k: v.to("cuda") if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+                # Forward
+                # Check if we need to use no_sync for DDP if accumulating
+                if isinstance(self.model, DistributedDataParallel) and self.n_micro_batches_per_batch > 1:
+                     # This is tricky without knowing if it's the last microbatch.
+                     # But we are in a loop.
+                     # Actually DDP no_sync is for accumulating gradients without sync.
+                     # We sync only on last step.
+                     # But for simplicity, if DP=1, DDP wraps it but syncs with itself (trivial).
+                     # The user said DP is removed (size 1). So sync overhead is small.
+                     output = self.model(**batch)
+                else:
+                     output = self.model(**batch)
+
+                loss = output["loss"]
+                if "z_loss" in output:
+                     if z_loss_avg is None: z_loss_avg = torch.tensor(0.0, device="cuda")
+                     z_loss_avg += output["z_loss"].detach() / self.n_micro_batches_per_batch
+
+                # Scale loss
+                loss = loss / self.n_micro_batches_per_batch
+
+                # Backward
+                loss.backward()
+
+                loss_avg += loss.detach()
+                outputs.append({k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in output.items()})
+
         nanotron_timer("train_batch_iter", "cuda").end()
 
         if self.iteration_step < self.initial_iter_step + 5:
@@ -644,14 +659,7 @@ class DistributedTrainer:
             if self.parallel_context.context_parallel_size > 1:
                 raise NotImplementedError("Context parallel size > 1 is not supported yet without DDP")
             # Manually sync across DP if it's not handled by DDP
-            sync_gradients_across_dp(
-                module=self.model,
-                dp_pg=self.parallel_context.dp_pg,
-                reduce_op=dist.ReduceOp.AVG,
-                # TODO @thomasw21: This is too memory hungry, instead we run all_reduce
-                reduce_scatter=False,  # optimizer.inherit_from(ZeroDistributedOptimizer),
-                grad_accumulator=self.grad_accumulator,
-            )
+            pass
 
         # TODO @nouamane: Put this in hooks so we can overlap communication with gradient computation on the last backward pass.
         sync_tied_weights_gradients(
@@ -679,23 +687,7 @@ class DistributedTrainer:
         nanotron_timer("clip_gradients", "cuda").end()
 
         # Compute DP-CP average loss and overlap with optimizer step
-        if isinstance(outputs[0]["loss"], torch.Tensor):
-            # This is an average on only one data rank.
-            loss_avg = torch.stack(
-                [output["loss"] for output in outputs]
-            ).sum()  # already divided by n_micro_batches_per_batch
-            if "z_loss" in outputs[0]:
-                z_loss_avg = torch.stack(
-                    [output["z_loss"] for output in outputs]
-                ).sum()  # already divided by n_micro_batches_per_batch
-            else:
-                z_loss_avg = None
-            # sync loss across DP-CP (we should do the same for z_loss but it's only for logging so let's not sync it rn)
-            handle = dist.all_reduce(loss_avg, group=self.parallel_context.dp_cp_pg, async_op=True, op=dist.ReduceOp.AVG)
-        else:
-            z_loss_avg = None
-            loss_avg = None
-            handle = None
+        handle = None
 
         # Move optimizer states back to GPU before optimizer step
         if (
@@ -730,17 +722,19 @@ class DistributedTrainer:
 
         return outputs, loss_avg, z_loss_avg, tbi_logs
 
-    def validation_step(self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]) -> Iterable[Dict]:
-        outputs = self.pipeline_engine.validate_batch_iter(
-            model=self.model,
-            batch=(next(dataloader) for _ in range(self.limit_val_batches)),
-            nb_microbatches=self.limit_val_batches,
-        )
+    def validation_step(self, dataloader: Iterator[Dict[str, Union[torch.Tensor]]]) -> Iterable[Dict]:
+        outputs = []
+        with torch.no_grad():
+            for _ in range(self.limit_val_batches):
+                batch = next(dataloader)
+                batch = {k: v.to("cuda") if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                output = self.model(**batch)
+                outputs.append({k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in output.items()})
         return outputs
 
     def train_step_logs(
         self,
-        outputs: Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]],
+        outputs: Iterable[Dict[str, Union[torch.Tensor]]],
         loss_avg: Optional[torch.Tensor],
         z_loss_avg: Optional[torch.Tensor],
         tbi_logs: Optional[Dict[str, torch.Tensor]],
